@@ -1,0 +1,87 @@
+# silk configuration (YAML)
+# Copy to /etc/silk/config.yaml or pass -c <path> (silk -c /etc/silk/config.yaml).
+
+general:
+  # LAN capture interface (gateway mode): "auto", a name, or omit/empty to
+  # disable LAN capture.
+  lan: auto
+  # WAN capture interface (host mode): captures locally-originated egress.
+  wan: auto
+  # Verdict when no rule matches: "direct" | "block" | a node name.
+  default: hy2
+  # Skb mark steering traffic into the proxy namespace. Change only if it
+  # collides with something else on the box.
+  #tproxy_mark: 0x2027
+
+nodes:
+  # 列表形式：type 选择协议，name 唯一，被 rules / cgroups / general.default
+  # 引用。同一 type 可以配置多个不同 name 的节点；用不到的协议不用写。
+  - type: socks            # 等价于 socks5
+    server: 127.0.0.1:1080
+    name: socks
+    username: ""
+    password: ""
+
+  - type: hysteria2
+    server: example.com:443
+    name: hy2
+    password: "xxxx"
+    # TLS SNI; defaults to the server host.
+    sni: ""
+    # Skip server certificate verification (self-signed servers).
+    insecure: false       # 自签证书才设 true
+    # Local bandwidth ("80 Mbps", empty = auto/congestion control).
+    up: 80 Mbps
+    down: 300 Mbps
+
+  - type: vless
+    name: vless
+    server: example.com:443
+    uuid: 00000000-0000-0000-0000-000000000000
+    # Transport: "tcp" | "ws". TLS is optional (`tls`) on either transport.
+    network: tcp          # tcp | ws
+    tls: true
+    sni: ""
+    insecure: false
+    ws_path: /
+    ws_host: ""
+
+dns:
+  # Domestic resolver, queried directly (UDP, control-plane marked socket).
+  upstream: 223.5.5.5:53  # 国内 DNS,直连
+  # Overseas resolver, queried THROUGH the proxy node the domain routes to
+  # (the default node for unmatched domains) — split DNS;
+  # 不写 = 全部用 upstream.
+  remote: 8.8.8.8:53      # 境外 DNS,经代理查询
+
+sniff:
+  enable: true            # 嗅探 TLS SNI / HTTP Host,按域名重新分流
+  dial_by_domain: true    # 按域名拨号,由代理出口自己解析
+
+# 按进程豁免/强制(cgroup v2,仅本机流量),路径相对 /sys/fs/cgroup。
+# 值: bypass(永不捕获,直连) 或 节点名(公网流量强制走该节点,block 仍然生效)。
+# 裸服务名是 system.slice/<name>.service 的简写;其他特殊路径必须完整配置
+# (如 user-1000.slice/session-c1.scope、machine.slice/docker-abc123.scope)。
+# 规则覆盖整个子树,最深匹配者胜;id 在服务重启后每 3s 自动重新解析。
+cgroups:
+  system.slice/frps.service: bypass          # 永不被捕获,始终直连
+  qbittorrent: hy2                           # == system.slice/qbittorrent.service
+  user-1000.slice/session-c1.scope: bypass
+  machine.slice/docker-abc123.scope: hy2
+
+# 规则按处理方式分组,每条一行 "kind,value,verdict",从上到下匹配,首条命中即止。
+# verdict 可以是 direct / block / 节点名字:
+#   direct 和 block 在内核态就处理了;节点名字的流量进用户态,由该节点转发。
+# kind:
+#   cidr    目的 CIDR,如 10.0.0.0/8
+#   port    目的端口
+#   domain  域名后缀(标签匹配),"cn" 命中所有 *.cn
+#   source  文本规则集(纯列表或 sing-box JSON),按 verdict 展开
+#   binary  ARST FST 规则集(无后缀二进制文件,silk --convert-ruleset 生成,
+#           按 ARST 魔数自动识别)
+rules:
+  - cidr,10.0.0.0/8,direct
+  - domain,cn,direct
+  - source,/etc/silk/geosite-google.json,hy2
+  - binary,/etc/silk/cn-domain,vless
+  - port,25,block

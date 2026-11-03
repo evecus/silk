@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["silk-ebpf-common", "silk"]
+# silk-ebpf targets bpfel-unknown-none and must be built separately:
+#   cd silk-ebpf && cargo build --release -Zbuild-std=core --target bpfel-unknown-none
+exclude = ["silk-ebpf"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+
+[workspace.dependencies]
+silk-ebpf-common = { path = "silk-ebpf-common" }
+anyhow = "1"
+libc = "0.2"
+nix = { version = "0.30", features = ["net", "sched", "socket", "user", "fs", "mount"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
