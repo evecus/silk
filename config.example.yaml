@@ -1,0 +1,148 @@
+# silk configuration (YAML)
+# Copy to /etc/silk/config.yaml or pass -c <path> (silk -c /etc/silk/config.yaml).
+
+general:
+  # LAN capture interface (gateway mode): "auto", a name, or omit/empty to
+  # disable LAN capture.
+  lan: auto
+  # WAN capture interface (host mode): captures locally-originated egress.
+  wan: auto
+  # Verdict when no rule matches: "direct" | "block" | a node name.
+  default: hy2
+  # 日志等级: off | error | warn | info | debug | trace,默认 info。
+  # 环境变量 RUST_LOG 若已设置,优先于此项。
+  log: info
+  # Skb mark steering traffic into the proxy namespace. Change only if it
+  # collides with something else on the box.
+  #tproxy_mark: 0x2027
+
+nodes:
+  # 列表形式：type 选择协议，name 唯一，被 rules / cgroups / general.default
+  # 引用。同一 type 可以配置多个不同 name 的节点；用不到的协议不用写。
+  - type: socks            # 等价于 socks5
+    server: 127.0.0.1:1080
+    name: socks
+    username: ""
+    password: ""
+
+  - type: hysteria2
+    server: example.com:443
+    name: hy2
+    password: "xxxx"
+    # TLS SNI; defaults to the server host.
+    sni: ""
+    # Skip server certificate verification (self-signed servers).
+    insecure: false       # 自签证书才设 true
+    # Local bandwidth ("80 Mbps", empty = auto/congestion control).
+    up: 80 Mbps
+    down: 300 Mbps
+
+  - type: vless
+    name: vless
+    server: example.com:443
+    uuid: 00000000-0000-0000-0000-000000000000
+    # Transport: "tcp" | "ws". TLS is optional (`tls`) on either transport.
+    network: tcp          # tcp | ws
+    tls: true
+    sni: ""
+    insecure: false
+    ws_path: /
+    ws_host: ""
+
+  - type: vless
+    name: vless-xhttp
+    server: cdn.example.com:443
+    uuid: ...
+    network: xhttp
+    tls: true
+    client_fingerprint: chrome    # 只有这种非 REALITY 的 TLS 路径才生效
+    xhttp_path: /xhttp
+
+  - type: vless
+    name: vless-reality
+    server: example.com:443
+    uuid: 00000000-0000-0000-0000-000000000002
+    network: tcp
+    tls: true
+    sni: www.microsoft.com        # 伪装 SNI（REALITY dest）
+    # client_fingerprint 不要配 —— 配了也会被忽略并打 warn
+    reality_public_key: jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0
+    reality_short_id: 0123456789abcdef
+    # flow: xtls-rprx-vision      # 可选流控
+
+
+dns:
+  # 上游 DNS 写成 URL,协议由前缀决定,每种协议有默认端口(要改才写 :端口):
+  #   223.5.5.5  /  udp://223.5.5.5          UDP,默认 53(仅 UDP 可省略前缀)
+  #   tcp://223.5.5.5                        TCP,默认 53
+  #   tls://223.5.5.5                        DoT,默认 853
+  #   https://223.5.5.5/dns-query            DoH,默认 443(路径省略时为 /dns-query)
+  #   udp://223.5.5.5:5353  tls://dns.alidns.com:8853   自定义端口 / 域名主机
+  # IPv6 可直接写,或带端口时用方括号:2606:4700::1111  /  [2606:4700::1111]:5353
+  # 国内 DNS,直连(控制面标记 socket,不会被自己捕获)。
+  upstream: 223.5.5.5
+  # 境外 DNS,经域名所走的代理节点查询(未匹配域名走默认节点)— 分流 DNS;
+  # 写法同 upstream(udp 走节点的 UDP 转发,tcp/tls/https 走节点的 TCP 连接)。
+  # 不写 = 全部用 upstream。
+  remote: tls://8.8.8.8
+  # 解析域名用的 DNS:节点的 server 域名、以及写成域名的 DNS 上游
+  # (如 tls://dns.alidns.com)都用它解析。必须是 IP 形式的普通 udp/tcp DNS
+  # (223.5.5.5 / 223.5.5.5:5353 / tcp://223.5.5.5)。
+  # 不写时:取 upstream 本身(upstream 是 IP 形式的 udp/tcp 时);节点域名则走系统解析。
+  # 节点 server 和 DNS 上游都是 IP 时用不到。
+  default: 223.5.5.5
+
+  # redb 文件(可选):持久化 DNS 缓存与 fake-IP 映射,重启后恢复。
+  # 不写 = 只用内存。目录不存在会自动创建;文件被另一个 silk 占用时会降级为内存模式。
+  #store: /var/lib/silk/state.redb
+
+  # Fake-IP(默认关闭):最终走节点的域名不做真实解析,直接返回 range 内的
+  # 假地址;内核把该网段送进用户态,relay 反查出域名后按域名分流并让代理出口
+  # 自己解析。direct / block 的域名不受影响(照旧真实解析,不进用户态)。
+  # AAAA 默认返回空应答(仅 IPv4);配置 range6 后 AAAA 也返回假地址。
+  # HTTPS/SVCB 一律返回空应答。
+  #fakeip:
+  #  enable: true
+  #  range: 198.18.0.0/15        # 前缀长度 8..=30
+  #  range6: fd00:198:18::/96    # 可选:IPv6 假地址段,与 range 逐槽位镜像;
+  #                              #   前缀长度 8..=(128-range 的主机位数),/15 时最大 /111
+  #  ttl: 1                      # 假应答的 TTL(秒)
+  #  exclude:                    # 一律真实解析的域名后缀(另有内置:local lan
+  #    - ntp.org                 #   localdomain localhost home.arpa 反向域)
+  #    - stun.l.google.com
+  #  include: []                 # 非空 = 白名单,只有这些后缀才给假地址
+
+sniff:
+  enable: true            # 嗅探 TCP 的 TLS SNI / HTTP Host 与 UDP 首包的 QUIC SNI,按域名重新分流
+  dial_by_domain: true    # 按域名拨号,由代理出口自己解析
+
+# 按进程豁免/强制(cgroup v2,仅本机流量),路径相对 /sys/fs/cgroup。
+# 按处理方式分组:键是 bypass(永不捕获,直连) 或 节点名(公网流量强制走该节点,
+# block 仍然生效),值是该处理方式下的 cgroup 列表。同一个 cgroup 不能出现在两组里。
+# 裸服务名是 system.slice/<name>.service 的简写;其他特殊路径必须完整配置
+# (如 user-1000.slice/session-c1.scope、machine.slice/docker-abc123.scope)。
+# 规则覆盖整个子树,最深匹配者胜;id 在服务重启后每 3s 自动重新解析。
+cgroups:
+  bypass:                                    # 永不被捕获,始终直连
+    - system.slice/frps.service
+    - user-1000.slice/session-c1.scope
+  hy2:                                       # 公网流量强制走节点 hy2
+    - qbittorrent                            # == system.slice/qbittorrent.service
+    - machine.slice/docker-abc123.scope
+
+# 规则按处理方式分组,每条一行 "kind,value,verdict",从上到下匹配,首条命中即止。
+# verdict 可以是 direct / block / 节点名字:
+#   direct 和 block 在内核态就处理了;节点名字的流量进用户态,由该节点转发。
+# kind:
+#   cidr    目的 CIDR,如 10.0.0.0/8
+#   port    目的端口
+#   domain  域名后缀(标签匹配),"cn" 命中所有 *.cn
+#   source  文本规则集(纯列表或 sing-box JSON),按 verdict 展开
+#   binary  ARST FST 规则集(无后缀二进制文件,silk --convert-ruleset 生成,
+#           按 ARST 魔数自动识别)
+rules:
+  - cidr,10.0.0.0/8,direct
+  - domain,cn,direct
+  - source,/etc/silk/geosite-google.json,hy2
+  - binary,/etc/silk/cn-domain,vless
+  - port,25,block
