@@ -1,0 +1,77 @@
+name: Build Linux arm64
+
+on:
+ # push:
+   # branches: master
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-aarch64-musl:
+    name: silk (linux/aarch64-musl, static)
+    runs-on: ubuntu-24.04-arm   # native arm64 runner – no cross needed
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install stable toolchain + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install nightly + rust-src (for eBPF)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+          # Do NOT list bpfel-unknown-none here.
+          # That target has no prebuilt rust-std on aarch64 host;
+          # we use -Zbuild-std=core instead.
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            silk-ebpf
+            silk
+          key: musl
+
+      # Official recommendation: use prebuilt binary instead of cargo install.
+      # https://github.com/aya-rs/bpf-linker#installation
+      - name: Install bpf-linker (prebuilt)
+        run: |
+          set -eux
+          curl -fsSL -o bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-aarch64-unknown-linux-musl.tar.zst
+          mkdir -p "$HOME/.local/bin"
+          tar -xpf bpf-linker.tar.zst -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bpf-linker --version || true
+
+      - name: Build eBPF object
+        working-directory: silk-ebpf
+        run: |
+          cargo +nightly build --release \
+            -Zbuild-std=core \
+            --target bpfel-unknown-none
+
+      - name: Build userspace (aarch64-musl, static, with ebpf)
+        run: |
+          # Fully static musl binary
+          export RUSTFLAGS="-C target-feature=+crt-static -C link-self-contained=yes"
+          cargo +stable build --release --features ebpf \
+            --target aarch64-unknown-linux-musl
+
+      - run: mv target/aarch64-unknown-linux-musl/release/silk target/aarch64-unknown-linux-musl/release/silk-linux-arm64
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test
+          files: target/aarch64-unknown-linux-musl/release/silk-linux-arm64
