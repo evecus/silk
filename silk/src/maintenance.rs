@@ -86,16 +86,12 @@ fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, StatsCounters, bool) {
     let mut removed = 0usize;
     if !temp_fail {
         for key in &keys {
-            match guard.flow_track.get(key, 0) {
-                Ok(entry) => {
-                    if now.saturating_sub(entry.last_seen_ns) > FLOW_TRACK_IDLE_NS
-                        && guard.flow_track.remove(key).is_ok()
-                    {
-                        removed += 1;
-                    }
-                }
-                // KeyNotFound 只说明扫描期间内核刚好删了它，忽略即可。
-                Err(_) => {}
+            // get 失败（KeyNotFound）只说明扫描期间内核刚好删了它，忽略即可。
+            if let Ok(entry) = guard.flow_track.get(key, 0)
+                && now.saturating_sub(entry.last_seen_ns) > FLOW_TRACK_IDLE_NS
+                && guard.flow_track.remove(key).is_ok()
+            {
+                removed += 1;
             }
         }
     }
