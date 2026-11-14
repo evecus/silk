@@ -57,8 +57,8 @@ use super::reality::{
 /// handshake type 25：CompressedCertificate（RFC 8879）。
 const HS_COMPRESSED_CERTIFICATE: u8 = 25;
 
-/// 解压 CompressedCertificate 消息体：algorithm(2) + uncompressed_len(3)
-/// + compressed_len(3) + data。我们只在 ClientHello 里声明了 brotli(2)。
+/// 解压 CompressedCertificate 消息体：algorithm(2)、uncompressed_len(3)、
+/// compressed_len(3)、data。我们只在 ClientHello 里声明了 brotli(2)。
 fn decompress_certificate(body: &[u8]) -> Result<Vec<u8>> {
     use std::io::Read;
     let mut pos = 0;

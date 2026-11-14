@@ -182,7 +182,7 @@ pub struct TrackEntry {
     /// 1 = host-originated (reply: inject into WAN RX with BPF_F_INGRESS).
     pub from_wan: u8,
     /// The kernel verdict that sent this flow to userspace (VERDICT_NODE_BASE
-    /// + node index, or VERDICT_PROXY). Userspace reads it to pick the node.
+    /// plus node index, or VERDICT_PROXY). Userspace reads it to pick the node.
     pub verdict: u8,
     pub _pad: [u8; 2],
     /// Captured framing: LAN client MAC (src) and router MAC (dst).
@@ -265,8 +265,8 @@ impl FlowDecisionEntry {
     }
 }
 
-/// [方案四] 一个 IP 数据报在重组期间的身份：源/目的地址 + identification
-/// + 上层协议。IPv4 的 ID 只有 16 位，IPv6 Fragment header 的是 32 位，
+/// [方案四] 一个 IP 数据报在重组期间的身份：源/目的地址、identification
+/// 以及上层协议。IPv4 的 ID 只有 16 位，IPv6 Fragment header 的是 32 位，
 /// 统一存成 u32。RFC 8200 只按 (src, dst, id) 重组，IPv6 后续片解析不到
 /// 上层协议，所以 v6 的 l4proto 固定为 0，避免与首片不匹配。
 #[repr(C)]
