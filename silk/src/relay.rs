@@ -256,7 +256,7 @@ pub async fn run_udp(
         set.spawn(async move { run_udp_worker(i, sock, ctx, dns).await });
     }
     // 任一 worker 退出都视为整体故障：结束 udp_task 让 main 走清理流程。
-    while let Some(res) = set.join_next().await {
+    if let Some(res) = set.join_next().await {
         set.abort_all();
         return match res {
             Ok(r) => r,
