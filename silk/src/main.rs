@@ -254,6 +254,9 @@ async fn main() -> Result<()> {
         sniff: config.sniff.enable,
         dial_by_domain: config.sniff.dial_by_domain,
         fakeip: fake_pool.clone(),
+        // [方案八] TCP/53 在已 accept 的连接上就地应答，与 UDP/53 共用
+        // 同一个 DNS 引擎（缓存 / fake-IP / 分流发布全部共享）。
+        dns: dns.clone(),
     });
     let udp_ctx = Arc::new(relay::UdpCtx {
         nodes: nodes.clone(),
@@ -313,7 +316,14 @@ async fn main() -> Result<()> {
     let mut udp_socks = listeners.udp4;
     udp_socks.extend(listeners.udp6);
     tracing::info!(udp_listeners = udp_socks.len(), "parallel UDP listener group up");
-    let mut tcp_task = tokio::spawn(relay::run_tcp(listeners.tcp4, tcp_ctx));
+    // [方案八] v4/v6 两个 TCP listener 都必须 accept：listener::create()
+    // 把 v6 socket 发布到 sockmap 的 KEY_TCP6，sk_lookup 会把所有
+    // AF_INET6/TCP 连接交给它；旧实现只 accept tcp4，IPv6 TCP 代理连接
+    // 会一直挂在半连接队列里直到超时。用 JoinSet 同时驱动两个 accept 循环。
+    let mut tcp_socks = vec![listeners.tcp4];
+    tcp_socks.extend(listeners.tcp6);
+    tracing::info!(tcp_listeners = tcp_socks.len(), "TCP listener group up");
+    let mut tcp_task = tokio::spawn(relay::run_tcp(tcp_socks, tcp_ctx));
     let mut udp_task = tokio::spawn(relay::run_udp(udp_socks, udp_ctx, dns.clone()));
 
     // [方案七] 到这里静态规则、cgroup、DNS 恢复、全部监听器 FD 以及

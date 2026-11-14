@@ -2,7 +2,7 @@
 //!
 //! Decision order (first match wins), all resolved inside the kernel so
 //! direct traffic never leaves the TC hook:
-//!   1. DNS hijack   — UDP dst port 53 (steered to the userspace DNS engine)
+//!   1. DNS hijack   — TCP/UDP dst port 53 (steered to the userspace DNS engine)
 //!   2. DOMAIN_ROUTE — per-IP verdicts published by the DNS engine
 //!   3. CIDR tries   — longest prefix match on the destination
 //!   4. PORT_ROUTE   — destination port table
@@ -13,7 +13,7 @@ use crate::maps::{
 };
 use crate::packet::Pkt;
 use aya_ebpf::maps::lpm_trie::Key;
-use silk_ebpf_common::{FlowDecisionEntry, IPPROTO_UDP, RouteEntry, VERDICT_BLOCK, VERDICT_PROXY};
+use silk_ebpf_common::{DNS_PORT, FlowDecisionEntry, RouteEntry, VERDICT_BLOCK, VERDICT_PROXY};
 
 /// 静态规则条目是否属于当前世代。`generation == 0` 是启动期的通配条目，
 /// 永远生效；正数条目只在 ROUTE_GENERATION 相同时生效。这是两阶段原子
@@ -36,7 +36,13 @@ pub fn decide(pkt: &Pkt, generation: u32) -> u8 {
 
     // 1. DNS hijack: the userspace DNS engine answers and publishes
     //    DOMAIN_ROUTE entries so later data packets route by domain.
-    if param.dns_hijack != 0 && pkt.l4_proto == IPPROTO_UDP && pkt.dport == 53 && !pkt.is_fragment {
+    // [方案八] TCP/53 (DNS over TCP, RFC 7766) 同样劫持。此前只认 UDP，
+    // TCP DNS 查询会落到 CIDR/PORT/default，经常被送进代理节点，域名分流
+    // 对这些查询完全失效；honk 的 datapath.md 明确 "TCP and UDP port 53
+    // are exempt"（health gating 豁免）且两者都走 DNS 策略。
+    // 注意 cgroup 强制路径 decide_forced() 里 VERDICT_PROXY 直接返回，
+    // 所以 DNS 仍不受强制节点影响，与 honk 一致。
+    if param.dns_hijack != 0 && pkt.dport == DNS_PORT && !pkt.is_fragment {
         return VERDICT_PROXY;
     }
 
@@ -90,7 +96,7 @@ pub fn decide(pkt: &Pkt, generation: u32) -> u8 {
 #[inline(always)]
 pub fn decide_flow(pkt: &Pkt) -> u8 {
     let generation = route_generation();
-    if PARAM.load().flow_cache == 0 || pkt.is_fragment || pkt.dport == 53 {
+    if PARAM.load().flow_cache == 0 || pkt.is_fragment || pkt.dport == DNS_PORT {
         return decide(pkt, generation);
     }
 

@@ -13,7 +13,8 @@
 use crate::rules::StaticMaps;
 use aya::maps::{MapData, PerCpuArray};
 use silk_ebpf_common::{
-    FlowKey, StatsCounters, FLOW_TRACK_IDLE_NS, TCP_CLOSE_GRACE_NS, TCP_STATE_CLOSING,
+    DNS_PORT, DNS_TRACK_IDLE_NS, FlowKey, IPPROTO_UDP, StatsCounters, FLOW_TRACK_IDLE_NS,
+    TCP_CLOSE_GRACE_NS, TCP_STATE_CLOSING,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,10 +36,11 @@ pub fn spawn(maps: Arc<Mutex<StaticMaps>>, stop: Arc<Notify>) -> tokio::task::Jo
             }
             let task_maps = maps.clone();
             match tokio::task::spawn_blocking(move || sweep(&task_maps)).await {
-                Ok((removed, removed_closing, alive, s, temp_fail)) => {
+                Ok((removed, removed_closing, removed_dns, alive, s, temp_fail)) => {
                     tracing::info!(
                         removed,
                         removed_closing,
+                        removed_dns,
                         alive,
                         temp_fail,
                         direct_pkts = s.direct_pkts,
@@ -53,6 +55,7 @@ pub fn spawn(maps: Arc<Mutex<StaticMaps>>, stop: Arc<Notify>) -> tokio::task::Jo
                         track_insert_failed = s.track_insert_failed,
                         tcp_syn_reset = s.tcp_syn_reset,
                         tcp_closing = s.tcp_closing,
+                        dns_tcp_pkts = s.dns_tcp_pkts,
                         "flow janitor / datapath stats"
                     );
                 }
@@ -74,8 +77,11 @@ fn monotonic_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-/// 一次扫描。返回 (删除数, 其中 CLOSING 数, 存活数, 统计聚合, 时钟失败标志)。
-fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, usize, StatsCounters, bool) {
+/// 一次扫描。返回 (删除数, 其中 CLOSING 数, 其中 DNS 短流数, 存活数,
+/// 统计聚合, 时钟失败标志)。
+fn sweep(
+    maps: &Arc<Mutex<StaticMaps>>,
+) -> (usize, usize, usize, usize, StatsCounters, bool) {
     let now = monotonic_ns();
     let temp_fail = now == 0;
     // 控制面用的是 tokio 的异步 Mutex；spawn_blocking 的线程上要用
@@ -91,6 +97,7 @@ fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, usize, StatsCounters, 
 
     let mut removed = 0usize;
     let mut removed_closing = 0usize;
+    let mut removed_dns = 0usize;
     if !temp_fail {
         for key in &keys {
             // get 失败（KeyNotFound）只说明扫描期间内核刚好删了它，忽略即可。
@@ -98,11 +105,20 @@ fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, usize, StatsCounters, 
                 continue;
             };
             // [方案七] 内核见过 FIN/RST 的流打上 TCP_STATE_CLOSING，用
-            // 5 s 短窗口回收；普通流仍是 120 s。以前所有 TCP 关闭后都要
-            // 占着流表 120 s，短连接密集时表会被死条目塞满。
+            // 5 s 短窗口回收；普通流仍是 120 s。
             let closing = entry.tcp_state == TCP_STATE_CLOSING;
+            // [方案八] UDP/53 是短流：DNS 查询每次换源端口，一条查询就
+            // 占一条 FLOW_TRACK。用 10 s 窗口回收，避免高 QPS 下 65536
+            // 条表被 DNS 灌满、把正常代理流的回程 framing 挤掉。
+            // 对齐 honk is_short_lived_udp_traffic() 跳过 conntrack 的
+            // 意图；TCP/53 是长连接（一个连接多个查询），不适用。
+            let dns_short = !closing
+                && key.proto == IPPROTO_UDP
+                && (key.sport == DNS_PORT || key.dport == DNS_PORT);
             let idle_ns = if closing {
                 TCP_CLOSE_GRACE_NS
+            } else if dns_short {
+                DNS_TRACK_IDLE_NS
             } else {
                 FLOW_TRACK_IDLE_NS
             };
@@ -113,6 +129,9 @@ fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, usize, StatsCounters, 
                 if closing {
                     removed_closing += 1;
                 }
+                if dns_short {
+                    removed_dns += 1;
+                }
             }
         }
     }
@@ -121,6 +140,7 @@ fn sweep(maps: &Arc<Mutex<StaticMaps>>) -> (usize, usize, usize, StatsCounters, 
     (
         removed,
         removed_closing,
+        removed_dns,
         keys.len() - removed,
         stats,
         temp_fail,
@@ -146,6 +166,9 @@ fn aggregate(map: &PerCpuArray<MapData, StatsCounters>) -> StatsCounters {
         sum.track_insert_failed += v.track_insert_failed;
         sum.tcp_syn_reset += v.tcp_syn_reset;
         sum.tcp_closing += v.tcp_closing;
+        // [方案八] 不累加的话日志里的 dns_tcp_pkts 恒为 0，TCP/53
+        // 劫持是否真的生效就无从观测。
+        sum.dns_tcp_pkts += v.dns_tcp_pkts;
     }
     sum
 }

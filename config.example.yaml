@@ -51,6 +51,16 @@ general:
   #   只有 server→client 数据的单向长流不会被误删；
   # · 非首片不再读取不存在的 L4 头，短分片不会绕过首片的 BLOCK / 代理判决。
 
+  # 以下四项同样无需配置，第二轮修正（对齐 honk）：
+  # · v4 / v6 两个 TCP listener 都有 accept 循环，IPv6 TCP 代理连接不再
+  #   挂在无人接收的队列里直到超时；
+  # · 用户态能正确读回内核按规则选出的节点（FLOW_TRACK 查表键的端口
+  #   字节序与内核一致），多节点分流不再静默退化到 default；
+  # · TCP/53 与 UDP/53 一样劫持到 DNS 引擎，DNS-over-TCP (RFC 7766)
+  #   查询也会触发域名分流；
+  # · UDP/53 短流 10 s 回收（普通流仍 120 s），高 QPS 下不会灌满
+  #   FLOW_TRACK 而挤掉正常代理流的回程 framing。
+
   # 静态分流规则（cidr / port）支持 SIGHUP 无停机热重载：改完配置执行
   # `kill -HUP <pid>`，整套规则以"先写新一代、再一次翻转世代"的方式
   # 原子切换，无需重载 eBPF hook。domain 规则由 DNS 引擎按每次查询匹配，

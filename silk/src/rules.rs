@@ -400,16 +400,7 @@ impl StaticMaps {
     /// (`client` -> `orig`). `None` when no track entry exists (evicted) or
     /// it carries no node (DNS hijack).
     pub fn flow_verdict(&self, client: std::net::SocketAddr, orig: std::net::SocketAddr, udp: bool) -> Option<Verdict> {
-        let key = FlowKey {
-            src_ip: v6_mapped(client.ip()),
-            dst_ip: v6_mapped(orig.ip()),
-            // The kernel stores ports as read off the wire (network order).
-            sport: client.port().to_be(),
-            dport: orig.port().to_be(),
-            proto: if udp { silk_ebpf_common::IPPROTO_UDP } else { silk_ebpf_common::IPPROTO_TCP },
-            _pad: [0; 7],
-        };
-        let entry = self.flow_track.get(&key, 0).ok()?;
+        let entry = self.flow_track.get(&flow_key(client, orig, udp), 0).ok()?;
         Verdict::from_u8(entry.verdict)
     }
 
@@ -536,6 +527,27 @@ fn v6_mapped(ip: std::net::IpAddr) -> [u8; 16] {
     }
 }
 
+/// 构造 FLOW_TRACK / FLOW_DECISION 的查表键。必须与内核
+/// `Pkt::flow_key()` 完全一致：端口是**数值**（`(wire_hi << 8) | wire_lo`），
+/// 不是网络字节序。aya 的 HashMap 按 `#[repr(C)]` 的原始内存比较 key，
+/// 在 bpfel / x86 都是小端，所以用户态直接写 `SocketAddr::port()` 数值即可；
+/// 旧实现写 `.to_be()` 会额外翻转成 `[hi, lo]`，导致永远查不中、
+/// 内核按规则选出的节点被静默丢弃（所有代理流退化到 default）。
+fn flow_key(client: std::net::SocketAddr, orig: std::net::SocketAddr, udp: bool) -> FlowKey {
+    FlowKey {
+        src_ip: v6_mapped(client.ip()),
+        dst_ip: v6_mapped(orig.ip()),
+        sport: client.port(),
+        dport: orig.port(),
+        proto: if udp {
+            silk_ebpf_common::IPPROTO_UDP
+        } else {
+            silk_ebpf_common::IPPROTO_TCP
+        },
+        _pad: [0; 7],
+    }
+}
+
 pub fn parse_v4_cidr(s: &str) -> Result<(Ipv4Addr, u8)> {
     let (addr, plen) = s
         .split_once('/')
@@ -552,3 +564,59 @@ pub fn parse_v6_cidr(s: &str) -> Result<(Ipv6Addr, u8)> {
 
 /// Shared handle handed to the DNS engine.
 pub type SharedRules = Arc<tokio::sync::Mutex<Rules>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 内核 `Pkt::flow_key()` 把报文里的端口字节 `(hi << 8) | lo` 解析成
+    /// **数值**写进 `#[repr(C)]` 的 u16 字段；aya 的 HashMap 按原始内存
+    /// 比较 key。用户态查表键必须逐字节一致，否则 FLOW_TRACK 永远 miss，
+    /// 内核按规则选出的节点被静默丢弃、所有代理流退化到 default。
+    #[test]
+    fn flow_key_ports_match_kernel_numeric_value() {
+        let client: std::net::SocketAddr = "10.0.0.2:54321".parse().unwrap();
+        let orig: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+
+        // 模拟内核从报文字节（网络序）解析出端口数值。
+        let c_wire = 54321u16.to_be_bytes();
+        let kernel_sport = ((c_wire[0] as u16) << 8) | c_wire[1] as u16;
+        let o_wire = 443u16.to_be_bytes();
+        let kernel_dport = ((o_wire[0] as u16) << 8) | o_wire[1] as u16;
+
+        let key = flow_key(client, orig, false);
+        assert_eq!(key.sport, kernel_sport);
+        assert_eq!(key.dport, kernel_dport);
+        assert_eq!(key.proto, silk_ebpf_common::IPPROTO_TCP);
+        // 锁死旧实现的 `.to_be()` 回归：它在小端机上会翻转成 [hi, lo]。
+        assert_eq!(key.sport, client.port());
+        assert_ne!(key.sport, client.port().to_be());
+    }
+
+    /// `#[repr(C)]` 的原始字节必须与内核侧按数值端口构造的键完全一致。
+    #[test]
+    fn flow_key_is_byte_identical_to_kernel_layout() {
+        let client: std::net::SocketAddr = "192.168.1.10:12345".parse().unwrap();
+        let orig: std::net::SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let key = flow_key(client, orig, true);
+        let kernel_key = FlowKey {
+            src_ip: v6_mapped(client.ip()),
+            dst_ip: v6_mapped(orig.ip()),
+            sport: client.port(),
+            dport: orig.port(),
+            proto: silk_ebpf_common::IPPROTO_UDP,
+            _pad: [0; 7],
+        };
+        let as_bytes = |k: &FlowKey| -> &[u8] {
+            // SAFETY: FlowKey is #[repr(C)] and fully initialized (explicit pad).
+            unsafe {
+                std::slice::from_raw_parts(
+                    k as *const FlowKey as *const u8,
+                    std::mem::size_of::<FlowKey>(),
+                )
+            }
+        };
+        assert_eq!(as_bytes(&key), as_bytes(&kernel_key));
+        assert_eq!(key.dport, 53);
+    }
+}

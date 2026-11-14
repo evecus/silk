@@ -25,9 +25,9 @@ use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::helpers::{bpf_redirect, bpf_skb_store_bytes};
 use silk_ebpf_common::{
-    verdict_is_proxy, CGROUP_MODE_BYPASS, FlowKey, TPROXY_MARK, TrackEntry, CLASSIFIED_MARK,
-    FLOW_TRACK_REFRESH_NS, TCP_STATE_CLOSING, TCP_STATE_OPEN, VERDICT_BLOCK, VERDICT_DIRECT,
-    VERDICT_NODE_BASE,
+    verdict_is_proxy, CGROUP_MODE_BYPASS, DNS_PORT, FlowKey, IPPROTO_TCP, TPROXY_MARK, TrackEntry,
+    CLASSIFIED_MARK, FLOW_TRACK_REFRESH_NS, TCP_STATE_CLOSING, TCP_STATE_OPEN, VERDICT_BLOCK,
+    VERDICT_DIRECT, VERDICT_NODE_BASE,
 };
 
 const PACKET_HOST: u32 = 0;
@@ -107,7 +107,7 @@ fn do_capture(ctx: &TcContext, from_wan: u8) -> Verdict {
         && param.new_flow_limit != 0
         && param.flow_cache != 0
         && !pkt.is_fragment
-        && pkt.dport != 53
+        && pkt.dport != DNS_PORT
         && FLOW_DECISION.get_ptr(pkt.flow_key()).is_none()
         && observability::new_flow_exceeded(&pkt)
     {
@@ -136,6 +136,10 @@ fn do_capture(ctx: &TcContext, from_wan: u8) -> Verdict {
         Err(TC_ACT_SHOT)
     } else if verdict_is_proxy(verdict) {
         observability::count_proxy(ctx.skb.len());
+        // [方案八] 确认 TCP/53 劫持路径真的走到用户态（UDP/53 不计）。
+        if pkt.l4_proto == IPPROTO_TCP && pkt.dport == DNS_PORT {
+            observability::count_dns_tcp();
+        }
         redirect_to_proxy(ctx, &pkt, from_wan, verdict)
     } else {
         Ok(TC_ACT_OK)

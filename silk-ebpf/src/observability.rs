@@ -49,6 +49,8 @@ fn bump_one(field: u8) {
             3 => c.track_insert_failed += 1,
             4 => c.tcp_syn_reset += 1,
             5 => c.tcp_closing += 1,
+            // [方案八] TCP/53 DNS-over-TCP 劫持命中数。
+            6 => c.dns_tcp_pkts += 1,
             _ => {}
         }
     }
@@ -80,6 +82,10 @@ pub fn count_tcp_syn_reset() {
 }
 pub fn count_tcp_closing() {
     bump_one(5);
+}
+/// [方案八] 一个 TCP/53 包被判进用户态 DNS 引擎。
+pub fn count_dns_tcp() {
+    bump_one(6);
 }
 
 /// 每源每秒新流预算。`PARAM.new_flow_limit == 0` 时整条路径短路返回，

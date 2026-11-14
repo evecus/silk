@@ -77,6 +77,18 @@ pub const FRAGMENT_VERDICT_TTL_NS: u64 = 30_000_000_000;
 pub const FLOW_TRACK_IDLE_NS: u64 = 120_000_000_000;
 pub const FLOW_TRACK_REFRESH_NS: u64 = 30_000_000_000;
 
+/// [方案八] UDP/53 短流的 FLOW_TRACK 空闲回收阈值。DNS 查询每次换源端口，
+/// 一条查询就占一条 track；用 120 s 的统一阈值会在高 QPS 下把 65536 条表
+/// 灌满，导致 track_insert_failed、正常代理流的回程 framing 丢失。对齐
+/// honk `is_short_lived_udp_traffic()` 跳过 conntrack 的意图，但 silk 的
+/// FLOW_TRACK 同时承担 UDP 应答的 L2 framing，不能跳过，只能短回收。
+/// 只按 FlowKey 判定，不占 TrackEntry 的 ABI 位；TCP/53 不受影响（长连接）。
+pub const DNS_TRACK_IDLE_NS: u64 = 10_000_000_000;
+
+/// [方案八] TCP/53（DNS over TCP, RFC 7766）同样劫持到用户态 DNS 引擎。
+/// 内核只判 VERDICT_PROXY，长度前缀帧由 relay 在已 accept 的连接上处理。
+pub const DNS_PORT: u16 = 53;
+
 /// [方案七] TCP 首部 flags 字节（偏移 13）里的相关位。TC 层只读这一字节，
 /// 不解析完整 TCP 状态机：SYN 用来声明"同一五元组的新 incarnation"，
 /// FIN/RST 用来把流提前送入短回收窗口（对齐 honk 的 forward-SYN
@@ -148,9 +160,12 @@ impl Param {
 pub struct FlowKey {
     pub src_ip: [u8; 16],
     pub dst_ip: [u8; 16],
-    /// Network byte order.
+    /// 从报文端口字节解析出的**数值**（`(hi << 8) | lo`），不是网络字节序
+    /// 存储。内核 `Pkt::flow_key()` 与用户态 `StaticMaps::flow_verdict()`
+    /// 必须用同一个数值：写成 `port.to_be()` 会在小端机上把 53 变成
+    /// 13568，导致 FLOW_TRACK 永远查不中、内核按规则选出的节点被静默丢弃。
     pub sport: u16,
-    /// Network byte order.
+    /// 同上：端口数值。
     pub dport: u16,
     pub proto: u8,
     pub _pad: [u8; 7],
@@ -349,6 +364,9 @@ pub struct StatsCounters {
     pub tcp_syn_reset: u64,
     /// 被 FIN/RST 标记为 CLOSING 的流数量。
     pub tcp_closing: u64,
+    /// [方案八] 命中 TCP/53 DNS-over-TCP 劫持、送进用户态 DNS 引擎的包数。
+    /// 用来确认新路径真的生效（而不只是 UDP/53）。
+    pub dns_tcp_pkts: u64,
 }
 
 impl StatsCounters {
@@ -366,6 +384,7 @@ impl StatsCounters {
             track_insert_failed: 0,
             tcp_syn_reset: 0,
             tcp_closing: 0,
+            dns_tcp_pkts: 0,
         }
     }
 }

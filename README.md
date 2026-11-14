@@ -39,7 +39,7 @@ silk/         userspace: loader, netns, listeners, nodes (SOCKS5/Hysteria2/VLESS
 
 ### Routing decision (kernel, first match wins)
 
-1. DNS hijack — UDP dport 53 → userspace DNS engine
+1. DNS hijack — TCP/UDP dport 53 → userspace DNS engine
 2. `DOMAIN_ROUTE` — per-IP verdict published by the DNS engine
 3. CIDR longest-prefix match
 4. Port table
@@ -323,11 +323,27 @@ correctness gap. All are unconditional; none adds configuration.
 and `tcp_closing` so a full `FLOW_TRACK` map is observable instead of
 silently degrading reply delivery.
 
+## Round 2: correctness fixes (also aligned with honk)
+
+A second pass found three real bugs and one functional gap that could be
+fixed without importing honk's control plane. All are unconditional.
+
+| # | Item | Kind | Before → after |
+|---|------|------|----------------|
+| 1 | **TCP6 listener had no accept loop** | bug | `listener::create(..., has_v6, ...)` published the v6 socket to `KEY_TCP6` and `sk_lookup` assigned every AF_INET6/TCP connection to it, but `main` only spawned an accept loop for `tcp4`. All IPv6 TCP proxy connections hung in the backlog until timeout (round 1 fixed UDP6 but missed TCP6). `run_tcp` now takes a `Vec<TcpListener>` and drives the v4 + v6 accept loops together in a `JoinSet`. |
+| 2 | **`flow_verdict()` port byte order** | bug | Userspace built the `FLOW_TRACK` key with `.to_be()` ports while the kernel's `Pkt::flow_key()` stores the numeric port value (`(hi << 8) \| lo`). On bpfel/x86 (little-endian) the `#[repr(C)]` bytes never matched, so every kernel-selected node was silently dropped and all proxy flows degraded to `default`. Keys now use numeric ports; two regression tests lock the byte layout. |
+| 3 | **TCP/53 DNS hijack** | gap | `decide()` only hijacked UDP/53, so DNS-over-TCP queries (RFC 7766) were routed as ordinary connections and domain rules never applied to them. The kernel now hijacks both TCP and UDP dport 53; `DnsEngine::answer()` is transport-independent, and `relay` answers length-prefixed queries on the accepted connection (UDP still replies via a transparent socket). honk exempts both TCP and UDP 53 from health gating. |
+| 4 | **DNS short flows filling `FLOW_TRACK`** | optimisation | UDP/53 queries change source port each time and each occupied a track entry for 120 s; at high QPS the 65536-entry map filled up (`track_insert_failed`) and normal flows lost their reply framing. The janitor now reclaims UDP/53 entries after `DNS_TRACK_IDLE_NS` (10 s), matching the intent of honk's `is_short_lived_udp_traffic()`. TCP/53 is a long-lived connection and keeps normal TCP lifetime handling. |
+
+`DATAPATH_STATS` adds `dns_tcp_pkts` (aggregated into the janitor log) so the
+new TCP/53 path is observable, and the janitor additionally reports
+`removed_dns`. `DNS_PORT` and `DNS_TRACK_IDLE_NS` are shared ABI constants.
+
 ## What's intentionally missing (vs honk)
 
 - No geoip/geosite databases, no logic/parameter expressions
 - TCP/UDP via SOCKS5, Hysteria2 or VLESS only (no Salamander/Gecko obfuscation)
-- Only plain UDP/53 DNS hijack of *clients'* queries (no DoH/DoT interception); upstreams may be udp/tcp/tls/https
+- Only plain UDP/53 and TCP/53 DNS hijack of *clients'* queries (no DoH/DoT interception); upstreams may be udp/tcp/tls/https
 - No node groups / failover / load balancing; one domestic + one overseas DNS upstream
 - No full conntrack / TCP socket-ownership (`sock_ops`) / retirement fencing / NFQUEUE: silk only reads the TCP flags byte in `FLOW_TRACK`
 - No dead-outbound health gating (silk has no connectivity probe framework)

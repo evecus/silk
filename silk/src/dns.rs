@@ -1,6 +1,7 @@
-//! DNS engine: intercept UDP/53 flows, resolve through the configured
+//! DNS engine: intercept UDP/53 and TCP/53 flows, resolve through the configured
 //! upstream (udp/tcp/tls/https, see `dnsup`) on control-plane sockets, publish per-IP verdicts into
-//! DOMAIN_ROUTE, and answer the client through a `silkns` reply socket.
+//! DOMAIN_ROUTE, and answer the client — a `silkns` reply socket for UDP, a
+//! length-prefixed frame (RFC 7766) on the accepted connection for TCP.
 
 use crate::dnsup::{self, HostResolver, Upstream, Via};
 use crate::fakeip::FakeIpPool;
@@ -232,7 +233,29 @@ impl DnsEngine {
         }
     }
 
-    /// Handle one hijacked DNS flow. `payload` is the client's query,
+    /// [方案八] Resolve one hijacked DNS query into a wire answer, without
+    /// delivering it. Transport-independent: UDP/53 wraps this with a
+    /// transparent reply socket, TCP/53 writes a length-prefixed frame back
+    /// on the accepted connection (RFC 7766). Both publish the same
+    /// DOMAIN_ROUTE verdicts and share the cache / fake-IP / split-DNS path.
+    pub async fn answer(
+        &self,
+        payload: &[u8],
+        client: SocketAddr,
+        orig: SocketAddr,
+        maps: &Arc<Mutex<crate::rules::StaticMaps>>,
+    ) -> Result<Vec<u8>> {
+        let qname = query_name(payload).unwrap_or_default();
+        let qtype = query_type(payload).unwrap_or(0);
+        tracing::debug!(%client, %orig, %qname, qtype, "dns query hijacked");
+
+        // Resolve upstream and publish domain verdicts for every answer.
+        let response = self.resolve(payload, &qname, qtype, maps).await?;
+        tracing::debug!(%qname, len = response.len(), "dns upstream answered");
+        Ok(response)
+    }
+
+    /// Handle one hijacked UDP/53 flow. `payload` is the client's query,
     /// `client` its source, `orig` the original destination (DNS server).
     /// The reply socket is bound to `orig` inside `silkns` so the answer
     /// looks like it came from the queried resolver.
@@ -243,13 +266,7 @@ impl DnsEngine {
         orig: SocketAddr,
         maps: Arc<Mutex<crate::rules::StaticMaps>>,
     ) -> Result<()> {
-        let qname = query_name(payload).unwrap_or_default();
-        let qtype = query_type(payload).unwrap_or(0);
-        tracing::debug!(%client, %orig, %qname, qtype, "dns query hijacked");
-
-        // Resolve upstream and publish domain verdicts for every answer.
-        let response = self.resolve(payload, &qname, qtype, &maps).await?;
-        tracing::debug!(%qname, len = response.len(), "dns upstream answered");
+        let response = self.answer(payload, client, orig, &maps).await?;
 
         // Answer through a transparent socket bound to the queried resolver.
         let reply_sock = create_reply_socket(orig)?;

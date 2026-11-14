@@ -20,7 +20,10 @@ pub struct Listeners {
     pub tcp4: tokio::net::TcpListener,
     /// 阻塞 socket：每个由一条独立的 recvmsg 线程消费（见 relay）。
     pub udp4: Vec<std::net::UdpSocket>,
-    #[allow(dead_code)]
+    /// v6 TCP 监听。`create(..., has_v6 = true, ...)` 会把它发布到 sockmap
+    /// 的 KEY_TCP6，sk_lookup 把所有 AF_INET6/TCP 连接都交给它 —— 因此
+    /// 必须有人 accept（见 relay::run_tcp），否则 IPv6 TCP 代理连接会全部
+    /// 挂在半连接队列里直到超时。
     pub tcp6: Option<tokio::net::TcpListener>,
     /// [方案二] v6 并行监听组。旧版创建了却没人 recv，数据报会在队列里
     /// 堆积到溢出；现在一并交给 relay 消费。

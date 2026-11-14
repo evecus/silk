@@ -2,7 +2,9 @@
 //!
 //! TCP: accepted conns carry the original destination (IP_TRANSPARENT +
 //! sk_lookup assignment); relay to the flow's node (SOCKS5 / Hysteria2 / VLESS) over a
-//! control-plane marked dial socket, copying both directions.
+//! control-plane marked dial socket, copying both directions. Port 53 is
+//! DNS over TCP (RFC 7766): length-prefixed queries answered via the DNS engine
+//! on the accepted connection instead of being relayed to a node.
 //!
 //! UDP: each datagram carries its original destination via IP_RECVORIGDSTADDR.
 //! Flows to port 53 are handed to the DNS engine; other flows go through the
@@ -25,6 +27,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use silk_ebpf_common::DNS_PORT;
 
 /// Shared state for TCP flows.
 pub struct TcpCtx {
@@ -40,6 +43,8 @@ pub struct TcpCtx {
     pub dial_by_domain: bool,
     /// Fake-IP pool: destinations inside it map back to a domain.
     pub fakeip: Option<Arc<FakeIpPool>>,
+    /// [方案八] DNS 引擎：TCP/53 查询在已接受的连接上就地应答。
+    pub dns: Arc<crate::dns::DnsEngine>,
 }
 
 /// How long to wait for the client's first bytes. Clients speak first on TLS
@@ -49,7 +54,31 @@ const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 const SNIFF_MAX: usize = 4096;
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn run_tcp(listener: tokio::net::TcpListener, ctx: Arc<TcpCtx>) -> Result<()> {
+/// [方案八] v4/v6 两个 TCP listener 都必须 accept。`listener::create()` 在
+/// `has_v6` 时把 v6 socket 发布到 sockmap 的 KEY_TCP6，sk_lookup 会把所有
+/// AF_INET6/TCP 连接都交给它；旧实现只 accept `tcp4`，IPv6 TCP 代理连接
+/// 会一直挂在无人接收的队列里直到超时。用 JoinSet 同时驱动两个 accept
+/// 循环，任一退出都视为整体故障（与 run_udp 一致）。
+pub async fn run_tcp(listeners: Vec<tokio::net::TcpListener>, ctx: Arc<TcpCtx>) -> Result<()> {
+    if listeners.is_empty() {
+        anyhow::bail!("no TCP listeners to serve");
+    }
+    let mut set = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let ctx = ctx.clone();
+        set.spawn(async move { accept_loop(listener, ctx).await });
+    }
+    if let Some(res) = set.join_next().await {
+        set.abort_all();
+        return match res {
+            Ok(r) => r,
+            Err(e) => Err(anyhow::anyhow!("tcp accept loop panicked: {e}")),
+        };
+    }
+    Ok(())
+}
+
+async fn accept_loop(listener: tokio::net::TcpListener, ctx: Arc<TcpCtx>) -> Result<()> {
     loop {
         let (conn, client) = match listener.accept().await {
             Ok(x) => x,
@@ -69,6 +98,15 @@ pub async fn run_tcp(listener: tokio::net::TcpListener, ctx: Arc<TcpCtx>) -> Res
 
 async fn handle_tcp(mut conn: TcpStream, client: SocketAddr, ctx: Arc<TcpCtx>) -> Result<()> {
     let orig = orig_dst_tcp(&conn)?;
+
+    // [方案八] TCP/53 是 DNS over TCP (RFC 7766)：内核已把该目的端口判成
+    // VERDICT_PROXY 送进用户态，这里按 2 字节长度前缀逐条交给 DNS 引擎，
+    // 在**已接受的连接上**应答（UDP/53 才需要 create_reply_socket）。
+    // 必须排在 sniff / fake-IP / 节点选择之前：DNS 报文不是 TLS/HTTP，
+    // 嗅探会白等 300 ms，而 VERDICT_PROXY 本身不带节点信息。
+    if orig.port() == DNS_PORT {
+        return handle_tcp_dns(&mut conn, client, orig, &ctx).await;
+    }
 
     // 1. The name: a fake address maps straight back to its domain (no
     //    sniffing needed); otherwise sniff the client's first bytes
@@ -142,6 +180,65 @@ async fn handle_tcp(mut conn: TcpStream, client: SocketAddr, ctx: Arc<TcpCtx>) -
     tracing::debug!(%orig, name = ?dial_name, node = ctx.nodes.name(node_idx), "tcp proxy dial");
     let upstream: BoxStream = outbound.connect_tcp(orig, dial_name.as_deref()).await?;
     relay(conn, upstream, early).await
+}
+
+/// [方案八] DNS over TCP (RFC 7766)：一条连接可承载多条 2 字节长度前缀
+/// 查询。内核把 TCP/53 判成 VERDICT_PROXY 送进已 accept 的透明连接，这里
+/// 逐条交给 DNS 引擎，在同一条连接上写回「长度前缀 + 应答」。UDP/53 才
+/// 需要 `create_reply_socket` 伪造来源；TCP 有连接，直接回写即可，且共享
+/// 同一套缓存、fake-IP、split-DNS 与 DOMAIN_ROUTE 发布路径。
+async fn handle_tcp_dns(
+    conn: &mut TcpStream,
+    client: SocketAddr,
+    orig: SocketAddr,
+    ctx: &TcpCtx,
+) -> Result<()> {
+    // 长度字段是 u16，同时用它挡住畸形长度导致的无界分配。
+    const MAX_MSG: usize = u16::MAX as usize;
+    // 只约束「等待下一条查询」的空闲时间，不打断单条查询的上游解析。
+    const IDLE: Duration = Duration::from_secs(30);
+
+    loop {
+        let mut len_buf = [0u8; 2];
+        // tokio 的 `read_exact` 返回读到的字节数（不是 `()`）；这里只关心
+        // 是否读满，用 `_` 忽略它。
+        match tokio::time::timeout(IDLE, conn.read_exact(&mut len_buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => return Err(e).context("dns/tcp read length"),
+            Err(_) => return Ok(()), // 空闲超时：关闭，客户端按需重连
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_MSG {
+            anyhow::bail!("dns/tcp invalid message length {len}");
+        }
+        let mut query = vec![0u8; len];
+        match conn.read_exact(&mut query).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(e).context("dns/tcp read message"),
+        }
+
+        let response = match ctx.dns.answer(&query, client, orig, &ctx.maps).await {
+            Ok(r) => r,
+            Err(e) => {
+                // 单条查询失败即断开：DNS over TCP 客户端会重连重试，比
+                // 在流上继续猜测帧边界更诚实（不会发出半截应答）。
+                tracing::warn!(error = %format!("{e:#}"), "dns/tcp query failed; closing connection");
+                return Ok(());
+            }
+        };
+        if response.len() > MAX_MSG {
+            anyhow::bail!("dns/tcp answer too large: {} bytes", response.len());
+        }
+        conn.write_all(&(response.len() as u16).to_be_bytes())
+            .await
+            .context("dns/tcp write length")?;
+        conn.write_all(&response)
+            .await
+            .context("dns/tcp write answer")?;
+        tracing::debug!(%client, %orig, len = response.len(), "dns/tcp reply sent");
+    }
 }
 
 /// Read the client's opening bytes until a name is found, the data is not
@@ -314,7 +411,7 @@ async fn run_udp_worker(
         let key = (client, orig);
 
         tracing::debug!(%client, %orig, len = payload.len(), "udp datagram in silkns");
-        if orig.port() == 53 {
+        if orig.port() == DNS_PORT {
             let dns = dns.clone();
             let maps = ctx.maps.clone();
             tokio::spawn(async move {
