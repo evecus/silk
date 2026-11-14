@@ -14,7 +14,7 @@ use silk_ebpf_common::{CONTROL_MARK, TPROXY_MARK};
 use silk_ebpf_common::UDP_LISTENER_MAX;
 
 #[cfg(feature = "ebpf")]
-use aya::maps::{lpm_trie::LpmTrie, HashMap};
+use aya::maps::{lpm_trie::LpmTrie, HashMap, PerCpuArray};
 #[cfg(feature = "ebpf")]
 use aya::programs::{SchedClassifier, SkLookup, TcAttachType};
 #[cfg(feature = "ebpf")]
@@ -413,6 +413,8 @@ pub fn load_and_attach(
         // 实际发布的槽位数一致（同一个 clamp）。
         flow_cache: u8::from(config.general.flow_cache),
         udp_workers: config.general.udp_workers.clamp(1, UDP_LISTENER_MAX as u8),
+        // [方案六] 0 = 关闭新流限速，整条路径在 TC 里短路返回。
+        new_flow_limit: config.general.new_flow_limit,
     };
 
     let mut ebpf = aya::EbpfLoader::new()
@@ -493,6 +495,8 @@ pub fn load_and_attach(
         cidr_v6: LpmTrie::try_from(take_map(&mut ebpf, "CIDR_V6")?)?,
         // [方案三] 规则世代：整套规则写完后再翻转它，实现原子换代。
         route_generation: HashMap::try_from(take_map(&mut ebpf, "ROUTE_GENERATION")?)?,
+        // [方案六] per-CPU 数据面计数，用户态定期按 CPU 聚合输出。
+        datapath_stats: PerCpuArray::try_from(take_map(&mut ebpf, "DATAPATH_STATS")?)?,
         // 启动期 config.rules 写过的 key，供热重载打墓碑。
         config_keys: ConfigKeys::default(),
     };

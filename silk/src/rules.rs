@@ -9,11 +9,11 @@
 
 use anyhow::{bail, Context, Result};
 use aya::maps::lpm_trie::Key;
-use aya::maps::{HashMap, MapData};
+use aya::maps::{HashMap, MapData, PerCpuArray};
 use fst::Set;
 use silk_ebpf_common::{
-    DomainRouteEntry, FlowKey, RouteEntry, TrackEntry, VERDICT_BLOCK, VERDICT_DIRECT,
-    VERDICT_NODE_BASE,
+    DomainRouteEntry, FlowKey, RouteEntry, StatsCounters, TrackEntry, VERDICT_BLOCK,
+    VERDICT_DIRECT, VERDICT_NODE_BASE,
 };
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
@@ -301,6 +301,8 @@ pub struct StaticMaps {
     pub cidr_v6: aya::maps::lpm_trie::LpmTrie<MapData, [u8; 16], RouteEntry>,
     /// [方案一/三] 当前规则世代，一次 map update 即可让所有每流缓存失效。
     pub route_generation: HashMap<MapData, u32, u32>,
+    /// [方案六] per-CPU 数据面计数；maintenance 任务定期按 CPU 聚合输出。
+    pub datapath_stats: PerCpuArray<MapData, StatsCounters>,
     /// 启动期 config.rules 写过的 key，供热重载打墓碑。
     pub config_keys: ConfigKeys,
 }

@@ -26,6 +26,19 @@ general:
   # 一条独立 recv 线程 + 一张独立 flow 表，多核并行、无锁竞争。
   udp_workers: 4
 
+  # [方案六] 每个 LAN 源地址每秒允许建立的新流数（0 = 关闭，默认）。
+  # 只在 LAN ingress 生效，用于抗 SYN / 新流洪泛；计数表是 per-CPU 的，
+  # 实际限额 = 该值 × CPU 数。DNS 查询与分片豁免。正常场景保持 0。
+  new_flow_limit: 0
+
+  # 以下三项无需配置，随 eBPF 对象生效：
+  # · 分片继承：首片判为代理/拦截的数据报，后续分片在 30 s 内继承同一
+  #   判决；IPv6 现在能正确跳过扩展头并识别 Fragment header。
+  # · FLOW_TRACK 改用普通 HashMap + 用户态 janitor，不再被内核 LRU 静默
+  #   驱逐活跃长连接；空闲 120 s 的条目由控制面每 30 s 回收一次。
+  # · 每 30 s 输出一条 per-CPU 聚合的数据面统计日志（direct/proxy/reply
+  #   包与字节、block、继承分片、被限速的新流）。
+
   # 静态分流规则（cidr / port）支持 SIGHUP 无停机热重载：改完配置执行
   # `kill -HUP <pid>`，整套规则以"先写新一代、再一次翻转世代"的方式
   # 原子切换，无需重载 eBPF hook。domain 规则由 DNS 引擎按每次查询匹配，

@@ -61,6 +61,26 @@ pub const CGROUP_MAX_DEPTH: i32 = 12;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
+/// IPv6 扩展头号（下一头部字段），方案四的解析器需要逐条跳过它们。
+pub const IPPROTO_HOPOPTS: u8 = 0;
+pub const IPPROTO_ROUTING: u8 = 43;
+pub const IPPROTO_FRAGMENT: u8 = 44;
+pub const IPPROTO_AH: u8 = 51;
+pub const IPPROTO_DSTOPTS: u8 = 60;
+
+/// 首片判决被后续分片继承的有效期（30 s）。IP ID 会被复用，超时后记录
+/// 自然失效，不会把新数据报的分片误判成旧数据报的命运。
+pub const FRAGMENT_VERDICT_TTL_NS: u64 = 30_000_000_000;
+
+/// FLOW_TRACK 条目的空闲回收阈值与刷新节流。内核按单调时钟写
+/// `last_seen_ns`，用户态 janitor 用 CLOCK_MONOTONIC 读同一个基准。
+pub const FLOW_TRACK_IDLE_NS: u64 = 120_000_000_000;
+pub const FLOW_TRACK_REFRESH_NS: u64 = 30_000_000_000;
+
+/// 每源每秒新流预算的默认值（0 = 关闭）。实际限额是该值乘以 CPU 数，
+/// 因为计数表是 LRU per-CPU hash。
+pub const NEW_FLOW_LIMIT_DEFAULT: u32 = 0;
+
 /// Immutable parameters written by userspace before programs attach.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -83,6 +103,9 @@ pub struct Param {
     /// 每族并行 UDP 监听 socket 数（1..=UDP_LISTENER_MAX）。sk_lookup 用它
     /// 作五元组哈希的模数，必须与用户态实际发布的槽位数一致。
     pub udp_workers: u8,
+    /// 每源每秒新流预算（0 = 关闭）。仅作用于 LAN ingress 的缓存未命中
+    /// 包，豁免 DNS 与分片；对齐 honk 的 NEW_FLOW_LIMIT_PER_CPU_SECOND。
+    pub new_flow_limit: u32,
 }
 
 impl Param {
@@ -95,6 +118,7 @@ impl Param {
         cgroup_rules: 0,
         flow_cache: 1,
         udp_workers: UDP_LISTENER_MAX as u8,
+        new_flow_limit: NEW_FLOW_LIMIT_DEFAULT,
     };
 }
 
@@ -164,6 +188,10 @@ pub struct TrackEntry {
     /// Captured framing: LAN client MAC (src) and router MAC (dst).
     pub smac: [u8; 6],
     pub dmac: [u8; 6],
+    /// [方案五] 最近一次该流有包经过的时间（bpf_ktime_get_ns，单调时钟）。
+    /// 用户态 janitor 按 CLOCK_MONOTONIC 比对后回收空闲条目，避免
+    /// LruHashMap 静默驱逐活跃长连接导致回程丢帧。
+    pub last_seen_ns: u64,
 }
 
 impl TrackEntry {
@@ -175,6 +203,7 @@ impl TrackEntry {
             _pad: [0; 2],
             smac: [0; 6],
             dmac: [0; 6],
+            last_seen_ns: 0,
         }
     }
 }
@@ -236,6 +265,86 @@ impl FlowDecisionEntry {
     }
 }
 
+/// [方案四] 一个 IP 数据报在重组期间的身份：源/目的地址 + identification
+/// + 上层协议。IPv4 的 ID 只有 16 位，IPv6 Fragment header 的是 32 位，
+/// 统一存成 u32。RFC 8200 只按 (src, dst, id) 重组，IPv6 后续片解析不到
+/// 上层协议，所以 v6 的 l4proto 固定为 0，避免与首片不匹配。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FragmentKey {
+    pub src_ip: [u8; 16],
+    pub dst_ip: [u8; 16],
+    pub id: u32,
+    pub l4proto: u8,
+    pub _pad: [u8; 3],
+}
+
+impl FragmentKey {
+    pub const fn new(src_ip: [u8; 16], dst_ip: [u8; 16], id: u32, l4proto: u8) -> FragmentKey {
+        FragmentKey {
+            src_ip,
+            dst_ip,
+            id,
+            l4proto,
+            _pad: [0; 3],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<FragmentKey>() == 40);
+
+/// [方案四] 首片判决被后续片继承的记录。`verdict == 0` 表示"首片放行"
+///（用于清除 ID 复用留下的旧记录），其余为 VERDICT_* 值。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FragmentVerdict {
+    pub verdict: u8,
+    pub _pad: [u8; 7],
+    pub ktime_ns: u64,
+}
+
+/// [方案六] per-CPU 数据面计数。放在 PerCpuArray 里，每包的累加只写
+/// 本 CPU 的槽位，零原子操作、零跨核缓存行竞争（honk OUTBOUND_STATS
+/// 的同一手法）。用户态按 CPU 聚合后输出。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StatsCounters {
+    pub direct_pkts: u64,
+    pub direct_bytes: u64,
+    pub proxy_pkts: u64,
+    pub proxy_bytes: u64,
+    pub reply_pkts: u64,
+    pub reply_bytes: u64,
+    pub block_pkts: u64,
+    pub frag_inherited: u64,
+    pub new_flow_limited: u64,
+}
+
+impl StatsCounters {
+    pub const fn zeroed() -> StatsCounters {
+        StatsCounters {
+            direct_pkts: 0,
+            direct_bytes: 0,
+            proxy_pkts: 0,
+            proxy_bytes: 0,
+            reply_pkts: 0,
+            reply_bytes: 0,
+            block_pkts: 0,
+            frag_inherited: 0,
+            new_flow_limited: 0,
+        }
+    }
+}
+
+/// [方案六] 每源每秒的新流窗口。LruPerCpuHashMap 让每个 CPU 独立计数，
+/// 有效限额 = count 上限 × CPU 数，且窗口切换只是一次就地写。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NewFlowWindow {
+    pub second: u32,
+    pub count: u32,
+}
+
 // Pod impls are only needed on the userspace side (aya map writes).
 // The BPF side (aya-ebpf) has no Pod trait requirement for btf_maps.
 #[cfg(not(target_arch = "bpf"))]
@@ -250,3 +359,11 @@ unsafe impl aya::Pod for DomainRouteEntry {}
 unsafe impl aya::Pod for RouteEntry {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for FlowDecisionEntry {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FragmentKey {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FragmentVerdict {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for StatsCounters {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for NewFlowWindow {}

@@ -3,7 +3,9 @@
 #![no_main]
 
 mod action;
+mod fragment;
 mod maps;
+mod observability;
 mod packet;
 mod routing;
 mod sk_lookup;

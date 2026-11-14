@@ -134,6 +134,11 @@ pub struct General {
     /// 同时写进 PARAM.udp_workers 作为 sk_lookup 五元组哈希的模数。
     #[serde(default = "default_udp_workers")]
     pub udp_workers: u8,
+    /// [方案六] 每个 LAN 源地址每秒允许建立的新流数（0 = 关闭，默认）。
+    /// 计数表是 per-CPU 的，实际限额 = 该值 × CPU 数；DNS 查询与分片豁免。
+    /// 用于抗 SYN/新流洪泛，正常场景保持 0。
+    #[serde(default)]
+    pub new_flow_limit: u32,
 }
 
 fn default_udp_workers() -> u8 {

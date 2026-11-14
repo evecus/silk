@@ -17,6 +17,7 @@ mod dnsup;
 mod fakeip;
 mod hysteria2;
 mod listener;
+mod maintenance;
 mod names;
 mod ns;
 mod outbound;
@@ -205,6 +206,10 @@ async fn main() -> Result<()> {
     );
     let rules: SharedRules = Arc::new(Mutex::new(rules_engine));
     let maps: Arc<Mutex<StaticMaps>> = Arc::new(Mutex::new(dp.take_maps()));
+    // [方案五/六] 流表 janitor（回收空闲 FLOW_TRACK）+ per-CPU 统计聚合。
+    // 与 DNS 缓存 flush 一样是 30 s 一轮，退出时由 stop 通知收尾。
+    let stop_maintenance = Arc::new(tokio::sync::Notify::new());
+    let maintenance_task = maintenance::spawn(maps.clone(), stop_maintenance.clone());
     datapath::install_control_marker(&dp)?;
 
     // 4. Transparent listeners inside silkns, published to the sockmap.
@@ -351,6 +356,9 @@ async fn main() -> Result<()> {
     }
     tcp_task.abort();
     udp_task.abort();
+    // [方案五/六] 先停 janitor，避免它在 eBPF 卸载后继续读 map。
+    stop_maintenance.notify_one();
+    maintenance_task.abort();
     // Relays are stopped, so the state is final: flush it before teardown.
     stop_saver.notify_one();
     if let Some(h) = saver

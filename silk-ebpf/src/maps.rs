@@ -5,15 +5,17 @@
 //! FLOW_TRACK (reply framing), DOMAIN_ROUTE (DNS-derived per-IP verdicts),
 //! CIDR tries, PORT_ROUTE, LISTEN_SOCKETS, SK_IDENTITY (loop prevention).
 
-use aya_ebpf::btf_maps::{HashMap, LruHashMap, SkStorage, SockMap};
+use aya_ebpf::btf_maps::{
+    HashMap, LruHashMap, LruPerCpuHashMap, PerCpuArray, SkStorage, SockMap,
+};
 use aya_ebpf::helpers::bpf_sk_storage_get;
 use aya_ebpf::macros::{btf_map, map};
 use aya_ebpf::maps::lpm_trie::LpmTrie;
 use aya_ebpf::Global;
 use aya_ebpf_bindings::helpers::bpf_skb_ancestor_cgroup_id;
 use silk_ebpf_common::{
-    CGROUP_MAX_DEPTH, DomainRouteEntry, FlowDecisionEntry, FlowKey, Param, RouteEntry,
-    TrackEntry, CONTROL_MARK,
+    CGROUP_MAX_DEPTH, DomainRouteEntry, FlowDecisionEntry, FlowKey, FragmentKey, FragmentVerdict,
+    NewFlowWindow, Param, RouteEntry, StatsCounters, TrackEntry, CONTROL_MARK,
 };
 pub use silk_ebpf_common::{KEY_TCP4, KEY_TCP6, KEY_UDP4_BASE, KEY_UDP6_BASE, LISTEN_SLOTS};
 
@@ -22,8 +24,32 @@ pub static PARAM: Global<Param> = Global::new(Param::DEFAULT);
 
 /// Forward-direction flow -> captured framing, for reply restoration in
 /// `silk0_ingress` (mirrors honk's REDIRECT_TRACK / CLIENT_REPLY_TRACK).
+///
+/// [方案五] 从 LruHashMap 换成普通 HashMap + BPF_F_NO_PREALLOC：这张表是
+/// 回程能否送回客户端的唯一依据，内核 LRU 在接近容量时会静默驱逐一条
+/// 仍然活跃的长连接，直接导致回程丢帧。普通表满时 insert 只是失败（可
+/// 观测、可重试），内存按需分配；由用户态 janitor 按 last_seen_ns 回收
+/// 空闲条目。这正是 honk 对 CONN_STATE_MAP 的取舍。
+/// 注意 FLOW_DECISION 仍保留 LRU：它只是判决缓存，被驱逐最多退化成
+/// 重判一次，不影响正确性（对应 honk 保留 LRU 的 CLIENT_REPLY_TRACK）。
 #[btf_map]
-pub static FLOW_TRACK: LruHashMap<FlowKey, TrackEntry, 65536> = LruHashMap::new();
+pub static FLOW_TRACK: HashMap<FlowKey, TrackEntry, 65536, 1> = HashMap::new();
+
+/// [方案四] 首片判为 PROXY / BLOCK 的数据报，后续分片继承同一命运。
+/// 小容量 + 30s TTL 足够覆盖重组窗口；LRU 驱逐只会让后续片退回原来的
+/// 地址级判决，不会破坏已有连接。
+#[btf_map]
+pub static FRAG_VERDICT: LruHashMap<FragmentKey, FragmentVerdict, 4096> = LruHashMap::new();
+
+/// [方案六] per-CPU 计数槽，单条目打包全部计数器。
+#[btf_map]
+pub static DATAPATH_STATS: PerCpuArray<StatsCounters, 1> = PerCpuArray::new();
+
+/// [方案六] 每源每秒新流预算。per-CPU 值让各 CPU 无需原子就能计数，
+/// LRU 满时只遗忘某个源最近的计数，不影响已有流。
+#[btf_map]
+pub static NEW_FLOW_RATE: LruPerCpuHashMap<[u8; 16], NewFlowWindow, 4096> =
+    LruPerCpuHashMap::new();
 
 /// [方案一] 每流判决缓存：FlowKey -> (verdict, generation)。首包跑完
 /// decide() 后写入，同流后续包只查这一张表，省掉 4~5 次规则表查找。
