@@ -23,9 +23,14 @@ const SK_PASS: u32 = 1;
 #[inline(always)]
 fn udp_listener_index(src: u32, dst: u32, sport: u16, dport: u16, workers: u32) -> u32 {
     let ports = ((sport as u32) << 16) | dport as u32;
+    // 不能直接写 `% workers`：运行时取余会带出 `panic_const_rem_by_zero`
+    // （`-> !`），LLVM 把它编成子程序末尾的一条 call 且后面不补 exit，
+    // verifier 会报 "Subprogram can fall through"。checked_rem 无 panic 分支；
+    // workers 已由 udp_workers() 保证非零，unwrap_or(0) 只是不可达的兜底。
     src.wrapping_add(dst.rotate_left(8))
         .wrapping_add(ports.rotate_left(16))
-        % workers
+        .checked_rem(workers)
+        .unwrap_or(0)
 }
 
 /// 模数必须与用户态实际发布的槽位数严格一致，否则会算出未发布的 key
