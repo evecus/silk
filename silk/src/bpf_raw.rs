@@ -72,3 +72,84 @@ pub fn set_socket_mark(fd: RawFd, mark: u32) -> Result<()> {
 pub fn fd_as_raw<F: AsRawFd>(f: &F) -> RawFd {
     f.as_raw_fd()
 }
+
+// ---------------------------------------------------------------------------
+// connect(2) that bypasses bionic's libnetd_client hook.
+//
+// On Android, libc `connect()` is routed through netd's fwmarkd. For sockets
+// carrying our control-plane SO_MARK that path fails with ENETUNREACH (TCP
+// dials and connected UDP sockets alike), while hook-free calls such as
+// sendto/sendmsg are fine. The datapath needs the mark to reach the kernel's
+// route lookup untouched, so every control-marked socket connects with the raw
+// syscall. On desktop Linux the syscall is identical to libc's connect().
+// ---------------------------------------------------------------------------
+
+/// Raw `connect` syscall on `fd` (non-blocking sockets return EINPROGRESS).
+pub fn raw_connect(fd: RawFd, addr: &std::net::SocketAddr) -> std::io::Result<()> {
+    let rc = unsafe {
+        match addr {
+            std::net::SocketAddr::V4(a) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: a.port().to_be(),
+                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(a.ip().octets()) },
+                    sin_zero: [0; 8],
+                };
+                libc::syscall(
+                    libc::SYS_connect,
+                    fd as libc::c_long,
+                    &sin as *const libc::sockaddr_in as libc::c_long,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::c_long,
+                )
+            }
+            std::net::SocketAddr::V6(a) => {
+                let sin6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: a.port().to_be(),
+                    sin6_flowinfo: a.flowinfo(),
+                    sin6_addr: libc::in6_addr { s6_addr: a.ip().octets() },
+                    sin6_scope_id: a.scope_id(),
+                };
+                libc::syscall(
+                    libc::SYS_connect,
+                    fd as libc::c_long,
+                    &sin6 as *const libc::sockaddr_in6 as libc::c_long,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::c_long,
+                )
+            }
+        }
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Drop-in for `TcpSocket::connect` that uses [`raw_connect`].
+pub async fn tcp_connect(
+    sock: tokio::net::TcpSocket,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let fd = sock.into_raw_fd();
+    // Own the fd right away so every error path closes it.
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+    std_stream.set_nonblocking(true)?;
+    match raw_connect(fd, &addr) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+        Err(e) => return Err(e),
+    }
+    let stream = tokio::net::TcpStream::from_std(std_stream)?;
+    stream.writable().await?;
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
+    Ok(stream)
+}
+
+/// Drop-in for `UdpSocket::connect` that uses [`raw_connect`].
+pub fn udp_connect(sock: &tokio::net::UdpSocket, addr: std::net::SocketAddr) -> std::io::Result<()> {
+    raw_connect(sock.as_raw_fd(), &addr)
+}

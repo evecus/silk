@@ -285,7 +285,7 @@ async fn dial_direct(dst: SocketAddr) -> Result<TcpStream> {
         TcpSocket::new_v6()?
     };
     crate::datapath::mark_global_control(sock.as_raw_fd())?;
-    tokio::time::timeout(DIRECT_DIAL_TIMEOUT, sock.connect(dst))
+    tokio::time::timeout(DIRECT_DIAL_TIMEOUT, crate::bpf_raw::tcp_connect(sock, dst))
         .await
         .map_err(|_| anyhow::anyhow!("direct dial {dst}: timeout"))?
         .with_context(|| format!("direct dial {dst}"))

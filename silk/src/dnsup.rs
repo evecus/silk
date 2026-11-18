@@ -360,7 +360,7 @@ async fn udp_exchange(addr: SocketAddr, query: &[u8], via: Via<'_>) -> Result<Ve
             mark(fd)?;
             std_sock.set_nonblocking(true)?;
             let sock = UdpSocket::from_std(std_sock)?;
-            sock.connect(addr).await?;
+            crate::bpf_raw::udp_connect(&sock, addr)?;
             sock.send(query).await?;
             loop {
                 let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf))
@@ -394,7 +394,7 @@ async fn open_stream(addr: SocketAddr, via: Via<'_>) -> Result<BoxStream> {
         Via::Direct => {
             let sock = if addr.is_ipv4() { TcpSocket::new_v4()? } else { TcpSocket::new_v6()? };
             mark(sock.as_raw_fd())?;
-            let s = tokio::time::timeout(TIMEOUT, sock.connect(addr))
+            let s = tokio::time::timeout(TIMEOUT, crate::bpf_raw::tcp_connect(sock, addr))
                 .await
                 .map_err(|_| anyhow!("dns connect {addr}: timeout"))?
                 .with_context(|| format!("dns connect {addr}"))?;

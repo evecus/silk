@@ -67,7 +67,7 @@ pub(crate) async fn dial_marked(server: SocketAddr) -> Result<TcpStream> {
         // production always installs it before the outbound is built.
         tracing::warn!("vless: control mark unavailable, dialing unmarked: {e:#}");
     }
-    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, sock.connect(server))
+    let stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, crate::bpf_raw::tcp_connect(sock, server))
         .await
         .map_err(|_| anyhow!("vless dial {server} timeout"))?
         .with_context(|| format!("vless dial {server}"))?;

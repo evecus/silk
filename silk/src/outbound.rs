@@ -154,7 +154,7 @@ impl UdpUpstream {
         crate::datapath::mark_global_control(fd)?;
         std_sock.set_nonblocking(true)?;
         let sock = UdpSocket::from_std(std_sock)?;
-        sock.connect(dst).await?;
+        crate::bpf_raw::udp_connect(&sock, dst)?;
         Ok(UdpUpstream::Direct(sock))
     }
 

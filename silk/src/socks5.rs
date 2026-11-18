@@ -64,7 +64,7 @@ impl Socks5Client {
             other => other,
         };
         // "Connect" fixes the peer so send/recv stay on the relay endpoint.
-        udp.connect(relay).await?;
+        crate::bpf_raw::udp_connect(&udp, relay)?;
         Ok((control, udp))
     }
 
@@ -87,7 +87,7 @@ impl Socks5Client {
 
     async fn dial(&self) -> Result<TcpStream> {
         let sock = self.new_tcp_socket()?;
-        sock.connect(self.server)
+        crate::bpf_raw::tcp_connect(sock, self.server)
             .await
             .context("dial SOCKS5 server")
     }
