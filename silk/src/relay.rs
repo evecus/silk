@@ -376,24 +376,39 @@ async fn run_udp_worker(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UdpEvent>();
     std::thread::Builder::new().name(format!("udp-recv-{id}")).spawn({
         use std::os::fd::AsRawFd;
-        move || loop {
+        move || {
+            // One buffer for the thread's lifetime: allocating + zeroing 64 KiB
+            // per datagram dominated CPU on UDP-heavy traffic (QUIC, calls).
             let mut buf = vec![0u8; 65535];
-            match unsafe { recv_orig_dst_blocking(sock.as_raw_fd(), &mut buf) } {
-                Ok((n, client, orig)) => {
-                    let payload = buf[..n].to_vec();
-                    if tx
-                        .send(UdpEvent {
-                            payload,
-                            client,
-                            orig,
-                        })
-                        .is_err()
-                    {
-                        break; // dispatcher gone: shut down
+            let mut errs = 0u32;
+            loop {
+                match unsafe { recv_orig_dst_blocking(sock.as_raw_fd(), &mut buf) } {
+                    Ok((n, client, orig)) => {
+                        errs = 0;
+                        let payload = buf[..n].to_vec();
+                        if tx
+                            .send(UdpEvent {
+                                payload,
+                                client,
+                                orig,
+                            })
+                            .is_err()
+                        {
+                            break; // dispatcher gone: shut down
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "udp recvmsg");
+                    Err(e) => {
+                        errs = errs.saturating_add(1);
+                        if errs <= 3 {
+                            tracing::warn!(error = %e, "udp recvmsg");
+                        }
+                        // A persistent error must not turn this into a busy loop.
+                        std::thread::sleep(Duration::from_millis(if errs > 3 {
+                            200
+                        } else {
+                            10
+                        }));
+                    }
                 }
             }
         }

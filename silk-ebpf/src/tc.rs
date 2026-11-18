@@ -25,7 +25,7 @@ use aya_ebpf::helpers::bpf_ktime_get_ns;
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::helpers::{bpf_redirect, bpf_skb_store_bytes};
 use silk_ebpf_common::{
-    verdict_is_proxy, CGROUP_MODE_BYPASS, DNS_PORT, FlowKey, IPPROTO_TCP, TPROXY_MARK, TrackEntry,
+    verdict_is_proxy, CGROUP_MODE_BYPASS, DNS_PORT, FlowKey, IPPROTO_TCP, TrackEntry,
     CLASSIFIED_MARK, FLOW_TRACK_REFRESH_NS, TCP_STATE_CLOSING, TCP_STATE_OPEN, VERDICT_BLOCK,
     VERDICT_DIRECT, VERDICT_NODE_BASE,
 };
@@ -156,9 +156,11 @@ fn steer_to_silkns(ctx: &TcContext) -> Verdict {
     }
     // Reply path authority: mark + tracked framing. silk0peer_ingress restores
     // the mark from cb[0] because the link crossing may scrub skb->mark.
-    ctx.skb.set_mark(TPROXY_MARK);
+    // The mark value comes from Param (userspace `general.mark`), so a custom
+    // mark in the config is honoured end to end.
+    ctx.skb.set_mark(param.mark);
     unsafe {
-        (*ctx.skb.skb).cb[0] = TPROXY_MARK;
+        (*ctx.skb.skb).cb[0] = param.mark;
     }
     // bpf_redirect_peer would bypass the backlog but is egress-only; TC
     // egress capture uses plain bpf_redirect, ingress capture may use either.
@@ -267,9 +269,10 @@ fn do_silk0peer_ingress(ctx: &TcContext) -> Verdict {
     if !datapath_ready() {
         return Ok(TC_ACT_OK);
     }
+    let param = PARAM.load();
     let cb0 = unsafe { (*ctx.skb.skb).cb[0] };
-    if cb0 == TPROXY_MARK {
-        ctx.skb.set_mark(TPROXY_MARK);
+    if cb0 == param.mark {
+        ctx.skb.set_mark(param.mark);
     }
     // The redirected frame still carries the original destination MAC, so
     // the veth crossing classifies it PACKET_OTHERHOST and ip_rcv() would

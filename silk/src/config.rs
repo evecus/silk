@@ -116,9 +116,11 @@ pub struct General {
     /// WAN capture interface (host mode), same forms as `lan`.
     #[serde(default)]
     pub wan: Option<String>,
-    /// Skb mark steering traffic into the proxy namespace.
+    /// Skb mark steering traffic into the proxy namespace. Written into the
+    /// kernel via `Param::mark` (tc steering + cb[0] check) and used by the
+    /// `silkns` policy routing rule, so both sides always agree.
     #[serde(default)]
-    pub tproxy_mark: Option<u32>,
+    pub mark: Option<u32>,
     /// Verdict when no rule matches: "direct" | "block" | a node name.
     #[serde(default = "default_verdict")]
     pub default: String,
@@ -655,7 +657,7 @@ general:
   lan: auto
   wan: auto
   default: hy2
-  tproxy_mark: 0x2027
+  mark: 0x2027
 nodes:
   - type: socks
     server: 127.0.0.1:1080
@@ -698,7 +700,7 @@ rules:
     fn parses_sample() {
         let c = parse(SAMPLE).unwrap();
         assert_eq!(c.nodes.len(), 3);
-        assert_eq!(c.general.tproxy_mark, Some(0x2027));
+        assert_eq!(c.general.mark, Some(0x2027));
         assert_eq!(c.rules.len(), 5);
         assert_eq!(c.rules[3].kind, "binary");
         assert_eq!(c.rules[3].verdict, "vless");

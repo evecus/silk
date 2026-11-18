@@ -5,8 +5,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 /// Skb mark reserved for traffic entering the proxy namespace (`silkns`).
-/// The `silkns` policy routing rule `fwmark TPROXY_MARK table 100` sends these
-/// packets to the local transparent listener table.
+/// The `silkns` policy routing rule `fwmark <steering mark> table 100` sends these
+/// packets to the transparent listeners. Overridable via `general.mark`; the
+/// configured value reaches the datapath through `Param::mark`, so the kernel
+/// and the policy routing always agree.
 pub const TPROXY_MARK: u32 = 0x2027;
 
 /// Socket mark for control-plane dials (SOCKS5, DNS upstream). Seen on
@@ -137,6 +139,10 @@ pub struct Param {
     /// 每源每秒新流预算（0 = 关闭）。仅作用于 LAN ingress 的缓存未命中
     /// 包，豁免 DNS 与分片；对齐 honk 的 NEW_FLOW_LIMIT_PER_CPU_SECOND。
     pub new_flow_limit: u32,
+    /// Steering mark (`general.mark`，缺省 TPROXY_MARK)。内核 tc 程序打
+    /// mark / 校验 cb[0] 都读这里，与用户态策略路由规则取同一个值，避免
+    /// "内核写常量、用户态按配置写 rule"各说各话。
+    pub mark: u32,
 }
 
 impl Param {
@@ -150,6 +156,7 @@ impl Param {
         flow_cache: 1,
         udp_workers: UDP_LISTENER_MAX as u8,
         new_flow_limit: NEW_FLOW_LIMIT_DEFAULT,
+        mark: TPROXY_MARK,
     };
 }
 

@@ -13,8 +13,10 @@ general:
   # 环境变量 RUST_LOG 若已设置,优先于此项。
   log: info
   # Skb mark steering traffic into the proxy namespace. Change only if it
-  # collides with something else on the box.
-  #tproxy_mark: 0x2027
+  # collides with something else on the box. Reaches both the kernel tc
+  # programs (Param::mark) and the silkns fwmark policy rule, so the two
+  # always stay in sync.
+  #mark: 0x2027
 
   # [方案一] 每流判决缓存（默认 true）：同一条流的后续包直接复用内核里
   # 缓存的判决，不再逐包查 4 张规则表；已判 DIRECT 的包再打高位 mark，

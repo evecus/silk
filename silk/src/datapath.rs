@@ -342,7 +342,7 @@ pub fn setup_links(config: &Config) -> Result<()> {
     // Marked packets deliver to local transparent sockets. A "local default"
     // route must sit on a device — use lo, which is up at this point.
     // `replace` keeps restarts against a stale netns idempotent.
-    let mark = tproxy_mark(config);
+    let mark = steering_mark(config);
     let _ = run_ip_netns(&["rule", "del", "fwmark", &format!("{mark:#x}"), "table", "100"]);
     run_ip_netns(&["rule", "add", "fwmark", &format!("{mark:#x}"), "table", "100"])?;
     run_ip_netns(&[
@@ -392,8 +392,8 @@ fn link_mac(name: &str) -> Result<String> {
     Ok(mac.to_string())
 }
 
-pub fn tproxy_mark(config: &Config) -> u32 {
-    config.general.tproxy_mark.unwrap_or(TPROXY_MARK)
+pub fn steering_mark(config: &Config) -> u32 {
+    config.general.mark.unwrap_or(TPROXY_MARK)
 }
 
 #[allow(dead_code)]
@@ -430,6 +430,8 @@ pub fn load_and_attach(
         udp_workers: config.general.udp_workers.clamp(1, UDP_LISTENER_MAX as u8),
         // [方案六] 0 = 关闭新流限速，整条路径在 TC 里短路返回。
         new_flow_limit: config.general.new_flow_limit,
+        // Steering mark：内核打 mark / 校验 cb[0] 与用户态 fwmark rule 同源。
+        mark: steering_mark(config),
     };
 
     let mut ebpf = aya::EbpfLoader::new()
