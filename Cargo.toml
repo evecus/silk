@@ -23,7 +23,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 [profile.release]
-opt-level = 2
-lto = "fat"
+lto = true
 codegen-units = 1
+panic = "abort"
+debug = false
 strip = true
+opt-level = 2
